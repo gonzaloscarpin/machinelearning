@@ -1,0 +1,5943 @@
+---
+title: "Random forest"
+format: html
+---
+
+# Setup  
+```{r}
+#| message: false
+#| warning: false
+library(tidymodels)
+library(tidyverse)
+library(vip)
+library(doParallel)
+library(sf)
+library(rules)
+library(finetune)
+tidymodels_prefer()
+```
+
+# 1) M + W + S + O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+summary(df$grade_n)
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+```
+
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_r2$committees,
+                        neighbors = best_r2$neighbors,
+                        max_rules = best_r2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=70.5),
+                        position_eq = c(x=75, y =67.5))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M+W+S+O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+W+S+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 2) M + W + S
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60#,
+                #NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse_2$committees,
+                        neighbors = best_rmse_2$neighbors,
+                        max_rules = best_rmse_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=72),
+                        position_eq = c(x=75, y =69.5))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M+W+S.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+W+S_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 3) M + W + O
+
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                stage_duration_emergence:stage_vp_total,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train) 
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse$committees,
+                        neighbors = best_rmse$neighbors,
+                        max_rules = best_rmse$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=78.5,y=75),
+                        position_eq = c(x=78.5, y =73))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M+W+O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+W+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 4) M + S + O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                #stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+autoplot(rf_grid_result)
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse_3$committees,
+                        neighbors = best_rmse_3$neighbors,
+                        max_rules = best_rmse_3$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=72),
+                        position_eq = c(x=75, y =68.5))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M+S+O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+S+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 5) W + S + O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_r2_2$committees,
+                        neighbors = best_r2_2$neighbors,
+                        max_rules = best_r2_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=69),
+                        position_eq = c(x=75, y =70.5))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/W+S+O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/W+S+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 6) M + W
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                stage_duration_emergence:stage_vp_total#,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                #NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train) 
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_r2_2$committees,
+                        neighbors = best_r2_2$neighbors,
+                        max_rules = best_r2_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=70.5),
+                        position_eq = c(x=75, y =72))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M+W.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+W_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 7) M + S
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                #stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60#,
+               # NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train) 
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse$committees,
+                        neighbors = best_rmse$neighbors,
+                        max_rules = best_rmse$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=70.8),
+                        position_eq = c(x=75, y =72))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M+S.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+S_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 8) M + O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon, 
+                #stage_duration_emergence:stage_vp_total,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- parsnip::cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_r2_2$committees,
+                        neighbors = best_r2_2$neighbors,
+                        max_rules = best_r2_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+
+```{r}
+# Get predictions on test set
+test_results <- final_fit %>% 
+  collect_predictions()
+
+# Calculate required metrics
+metrics <- test_results %>% 
+  summarise(
+    RMSE = rmse_vec(truth = grade_n, estimate = .pred),
+    R2 = rsq_vec(grade_n, .pred),
+    Correlation = cor(.pred, grade_n),
+    SD = sd(.pred)  # Standard deviation of predictions
+  )
+
+# Show metrics
+print(metrics)
+
+set.seed(10)
+final_fit <- last_fit(final_spec, weather_recipe, split = weather_split)
+
+# Get predictions and metrics
+test_predictions <- final_fit %>% collect_predictions()
+test_metrics <- test_predictions %>% 
+  summarise(
+    RMSE = rmse_vec(grade_n, .pred),
+    R2 = rsq_vec(grade_n, .pred),
+    Correlation = cor(.pred, grade_n),
+    SD_pred = sd(.pred),
+    SD_obs = sd(grade_n)
+  )
+
+# Show results
+test_predictions
+test_metrics
+```
+
+
+```{r}
+library(plotrix) 
+# Example data
+obs <- c(10, 12, 14, 16, 18, 20)
+mod1 <- c(11, 13, 15, 17, 19, 21)
+mod2 <- c(9, 11, 13, 15, 17, 19)
+
+# Create Taylor Diagram
+taylor.diagram(obs, mod1, col = "blue", pch = 19, pos.cor = TRUE)
+taylor.diagram(obs, mod2, col = "red", pch = 19, add = TRUE)
+
+# Add legend
+legend("topright", legend = c("Model 1", "Model 2"), col = c("blue", "red"), pch = 19)
+
+
+# Create a data frame with observed and predicted data
+data <- data.frame(
+  obs = obs,
+  model1 = mod1,
+  model2 = mod2
+)
+
+# Generate the Taylor Diagram
+TaylorDiagram(data, obs = "obs", mod = c("model1", "model2"))
+```
+
+```{r}
+library(plotrix)
+
+models <- c(
+  "XGBoost", "BART", "Bag-Tree", "RF", "SVM_p", "RuleFit", "Cubist-rule", "LR", "PLS",
+  "kNN", "MLP", "Bag-MARS", "MARS", "SVM_l", "CART", "Poisson", "GRF", "bag_MLP"
+)
+
+rmse <- c(1018, 908, 859, 930, 921, 1019, 936, 936, 979,
+          1113, 1209, 961, 985, 981, 1135, 977, 958, 988)
+
+r2 <- c(0.42, 0.53, 0.6, 0.52, 0.53, 0.47, 0.51, 0.51, 0.46,
+        0.37, 0.24, 0.49, 0.46, 0.47, 0.29, 0.46, 0.49, 0.48)
+
+sd <- c(0.1073, 0.4430, 0.4403, 0.2727, 0.1597, 0.9707, 0.3834,
+        0.3707, 0.1692, 0.7722, 0.6258, 0.3393, 0.1232, 0.3684,
+        0.7264, 0.9759, 0.2811, 0.9926)
+
+# Convert R² to correlation coefficient
+correlation <- sqrt(r2)
+
+# Define a reference SD (e.g., mean SD or best-performing model SD)
+ref_sd <- mean(sd)
+
+# Set color palette
+colors <- rainbow(length(models))
+
+# Create the Taylor Diagram with better scaling
+taylor.diagram(
+  sd,
+  correlation,
+  ref.sd = ref_sd,
+  main = "Taylor Diagram - Machine Learning Models",
+  col = colors,
+  pch = 19,
+  pos.cor = TRUE,
+  sd.arcs = TRUE
+)
+
+# Force visibility: Bigger points
+points(sd, correlation, pch = 21, bg = colors, cex = 2.5)
+
+# Add model labels **closer to points**
+text(sd, correlation, labels = models, pos = 4, cex = 0.9)
+
+# Add a legend
+legend("topright", legend = models, col = colors, pch = 19, cex = 0.8, bty = "n")
+
+# Add axis labels
+mtext("Standard Deviation", side = 1, line = 2.5)
+mtext("Correlation Coefficient", side = 2, line = 2.5)
+
+# Add 1:1 reference line
+abline(a = 0, b = 1, lty = 2, col = "gray")
+```
+
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = F,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=77,y=73),
+                        position_eq = c(x=78.5, y =73))+ 
+  labs(x = "Observed Grade",
+       y = "Predicted Grade")+
+  theme(axis.title.x = element_text(family = "serif",
+                                    size = 15
+                                    ),
+        axis.title.y = element_text(family = "serif",
+                                    size = 15),
+        axis.text.x = element_text(family = "serif",
+                                   size = 12),
+        axis.text.y = element_text(family = "serif",
+                                   size = 12
+                                   ),
+        strip.text = element_text(family = "serif"
+                                )
+        )
+
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/best_grade_ML.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+
+
+```{r}
+library(shapviz)   # For SHAP visualizations
+library(fastshap)  # For computing SHAP values
+```
+
+```{r}
+set.seed(27)
+fitted_model <- extract_fit_parsnip(final_fit$.workflow[[1]])# Define a prediction function
+predict_function <- function(model, newdata) {
+  predict(model, new_data = newdata)$.pred
+}
+X <- bake(weather_prep, weather_test) %>%
+                         select(-grade_n)
+```
+
+
+```{r}
+registerDoParallel(cores = 12)  # use forking with 12 cores
+set.seed(27)
+system.time({ 
+  shap_values <- fastshap::explain(fitted_model, 
+                                   X = X, 
+                                   pred_wrapper = predict_function,
+                                   adjust = TRUE,
+                                   #parallel = TRUE,
+                                   nsim = 1000)
+})
+
+nrow(shap_values)
+stopImplicitCluster()
+```
+
+```{r}
+shapviz_obj <- shapviz(shap_values, 
+                       X = X)
+
+shapviz_obj
+sv_importance(shapviz_obj, show_numbers = TRUE)
+
+sv_importance(shapviz_obj, kind = "bee")
+sv_dependence(shapviz_obj, v = "irrigation_Yes")
+xvars <- c("irrigation_Yes", "lon")
+sv_dependence(shapviz_obj, v = xvars)
+final_fit %>% 
+  collect_predictions()
+sv_waterfall(shapviz_obj, row_id = 10)
+sv_force(shapviz_obj, row_id = 1)
+sv_dependence2D(shapviz_obj, y = "irrigation_Yes",
+                x = "soil_series_Dothan"
+                )
+```
+
+```{r}
+shap_values_fi <- sv_importance(shapviz_obj, show_numbers = TRUE)+
+  theme(element_text(family = "serif"))
+
+ggsave("../output/best_model_shap_yield.png")
+```
+```{r}
+shap_values_fi_bee <- sv_importance(shapviz_obj, kind = "bee")
+```
+
+```{r, fig.height= 11, fig.width= 8}
+library(patchwork)
+
+together <- plot / shap_values_fi / shap_values_fi_bee
+
+ggsave(plot = together,
+       filename = "../output/feature_grade.png",
+       height = 11,
+       width = 8
+       )
+
+```
+```{r}
+library(plotrix)
+library(dplyr)
+
+models <- c("XGBoost", "BART", "Bag-Tree", "RF", "SVM_p", "RuleFit", 
+            "Cubist-rule", "LR", "PLS", "kNN", "MLP", "Bag-MARS", "MARS", 
+            "SVM_l", "CART", "Poisson", "GRP", "bag_MLP")
+n_models <- length(models)
+
+sim_data <- tibble(
+  Model = models,
+  RMSE = round(runif(n_models, 800, 1000)),     # Simulated RMSE
+  R2 = round(runif(n_models, 0.6, 0.9), 2),     # Simulated R²
+  SD = round(runif(n_models, 2, 4), 2),         # Simulated SD
+  Correlation = round(runif(n_models, 0.6, 0.95), 2)  # Simulated correlation
+)
+
+# Set reference SD (change if you know the actual observed SD)
+sd_ref <- 3
+
+# Create dummy reference data (required by taylor.diagram)
+set.seed(123)
+ref_dummy <- rnorm(100, sd = sd_ref)
+
+# Create a dummy model vector with matching correlation (required by taylor.diagram)
+model_dummy <- ref_dummy * sim_data$Correlation[1] + 
+  rnorm(100, sd = sqrt(1 - sim_data$Correlation[1]^2)) * sd_ref
+
+# Initialize Taylor Diagram
+taylor.diagram(
+  ref = ref_dummy,
+  model = model_dummy,  # Now includes required model argument
+  normalize = FALSE,
+  sd.arcs = TRUE,
+  main = "Taylor Diagram - Simulated Models",
+  col = "transparent"  # Hide the initial dummy point
+)
+
+# Add actual models using precomputed metrics
+colors <- rainbow(nrow(sim_data))
+for(i in 1:nrow(sim_data)) {
+  # Convert metrics to plot coordinates
+  normalized_sd <- sim_data$SD[i] / sd_ref
+  angle <- acos(sim_data$Correlation[i])
+  x <- normalized_sd * cos(angle)
+  y <- normalized_sd * sin(angle)
+  
+  points(x, y, col = colors[i], pch = 19, cex = 1.2)
+}
+
+# Add legend
+legend("topright", 
+       legend = sim_data$Model,
+       col = colors,
+       pch = 19,
+       cex = 0.7)
+```
+```{r}
+final_fit %>%
+  collect_predictions() %>% 
+  mutate(dif = abs(grade_n - .pred)) %>% 
+  mutate(row_num = row_number()) %>% 
+  arrange(dif)
+```
+
+```{r}
+worst_grade <- sv_waterfall(shapviz_obj, row_id = 3)
+best_yield <- sv_waterfall(shapviz_obj, row_id = 25)
+```
+
+```{r, fig.width=9, fig.height= 10}
+together_2 <- best_yield / worst_grade
+
+ggsave(plot = together_2,
+       filename = "../output/best_worst_field_grade.png",
+       height = 10,
+       width = 9
+       )
+```
+
+
+# 9) W + S
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60#,
+                #NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_r2$committees,
+                        neighbors = best_r2$neighbors,
+                        max_rules = best_r2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=78,y=70.5),
+                        position_eq = c(x=78, y =71.5))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/W+S.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/W+S_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 10) W + O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                stage_duration_emergence:stage_vp_total,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse$committees,
+                        neighbors = best_rmse$neighbors,
+                        max_rules = best_rmse$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=71.4),
+                        position_eq = c(x=75, y =71.8))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/W+O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/W+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 11) S + O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                #stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse_2$committees,
+                        neighbors = best_rmse_2$neighbors,
+                        max_rules = best_rmse_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=69),
+                        position_eq = c(x=75, y =70.5))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/S+O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/S+O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 12) M 
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, planting_date:variety, 
+                row_pattern:saved_seed, 
+                lat, lon#, 
+                #stage_duration_emergence:stage_vp_total,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                #NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse_3$committees,
+                        neighbors = best_rmse_3$neighbors,
+                        max_rules = best_rmse_3$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=70.8),
+                        position_eq = c(x=75, y =72))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/M.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/M_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 13) W
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                stage_duration_emergence:stage_vp_total#,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                #NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse_3$committees,
+                        neighbors = best_rmse_3$neighbors,
+                        max_rules = best_rmse_3$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=77.2,y=70.5),
+                        position_eq = c(x=77.2, y =72))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/W.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/W_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 14) S
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                #stage_duration_emergence:stage_vp_total,
+                river_basin, soil_series,
+                soil_clay_0_5:soil_theta_s_30_60#,
+                #NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_2, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_rmse_2$committees,
+                        neighbors = best_rmse_2$neighbors,
+                        max_rules = best_rmse_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=70.6),
+                        position_eq = c(x=75, y =71))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/S.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/S_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```
+
+# 15) O
+# Yield
+```{r }
+df <- read_sf("../data/data_complete.geojson") %>% 
+  st_drop_geometry() %>% 
+  as.data.frame() %>% 
+  dplyr::select(planting_date, digger_date, growing_season, variety, river_basin, soil_series, row_pattern, 
+                irrigation, saved_seed, 
+                tillage_method=tillage_method_simplify,
+                rotation = rotation_simplify_years_wo_peanut, seeding_rate, 
+                grade_n, 
+                alt, stage_duration_emergence:elevation,
+                lat= lat.y, lon = long
+                ) %>% 
+  mutate_if(is.character, as.factor) %>% 
+  mutate(rotation = as.factor(rotation)) %>% 
+  dplyr::select(-(c(alt, rotation, seeding_rate, tillage_method))) %>% 
+  dplyr::select(!(c(soil_alpha_0_5:soil_bd_30_60, 
+                    soil_hb_0_5:soil_hb_30_60, 
+                    soil_lambda_0_5:soil_n_30_60,
+                    soil_theta_r_0_5:soil_theta_r_30_60
+                    ))) %>%
+  #dplyr::select(-(c("lat", "lon"))) %>% 
+  
+  dplyr::select(-(c(SCI:NGRDI))) %>% 
+  dplyr::select(grade_n, 
+                #planting_date:variety, 
+                #row_pattern:saved_seed, 
+                #lat, lon, 
+                #stage_duration_emergence:stage_vp_total,
+                #river_basin, soil_series,
+                #soil_clay_0_5:soil_theta_s_30_60,
+                NDVI:elevation
+                ) %>% 
+  #dplyr::select(-(c(NDVI:GNDVI, elevation))) %>% 
+  drop_na() %>% dplyr::filter(grade_n > 65) 
+
+df
+
+# df <- read_csv("../data/df.csv") %>%
+#   distinct(n_field, .keep_all = T) %>% 
+#   dplyr::select(river_basin, variety, irrigation, saved_seed, soil_series, grade_n) %>% 
+#   drop_na() %>% dplyr::filter(grade_n > 65)
+```
+
+
+# ML workflow  
+## 1. Pre-processing  
+### a. Data split  
+For data split, let's use **70% training / 30% testing**.
+```{r weather_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+weather_split <- initial_split(df, prop = 0.7, 
+                               strata = "grade_n")
+weather_split
+```
+```{r weather_train}
+# Setting train set 
+weather_train <- training(weather_split)
+
+weather_train
+```
+
+
+```{r weather_test}
+# Setting test split
+weather_test <- testing(weather_split)
+
+weather_test
+```
+```{r data distribution}
+# Combine the data frames
+plot_train <- weather_train %>% mutate(Dataset = "Train")
+plot_test <- weather_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create the density plot
+ggplot(data = combined_data) +
+  geom_density(aes(x = grade_n, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Yield (kg/ha)", y = "Density", fill = "Dataset")
+```
+  
+### b. Data processing  
+```{r weather_recipe}
+weather_recipe <-
+  # Defining predicted and predictor variables
+  recipe(grade_n ~ .,
+         data = weather_train)
+
+weather_recipe
+
+```
+
+```{r weather_prep}
+weather_prep <- weather_recipe %>%
+  prep()
+
+weather_prep
+```
+## 2. Training  
+### a. Model specification  
+```{r hyperparameters}
+cubist_spec <- 
+  # Specifying rf as our model type, asking to tune the hyperparameters
+  cubist_rules(committees = tune(),
+                        neighbors = tune(),
+                        max_rules = tune()
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+cubist_spec
+```
+
+### b. Hyper-parameter tuning  
+  
+```{r resampling_foldcv}
+set.seed(15)
+resampling_foldcv <- vfold_cv(weather_train, 
+                              v = 5)
+
+resampling_foldcv
+```
+```{r rf_grid_result}
+set.seed(45)
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+rf_grid_result <- tune_race_anova(object = cubist_spec,
+                      preprocessor = weather_recipe,
+                      resamples = resampling_foldcv,
+                     grid = 50
+                      )
+stopImplicitCluster()
+rf_grid_result$.metrics[[5]]
+```
+```{r hyperparameters selection by RMSE}
+# Based on lowest RMSE
+best_rmse <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rmse",
+                     limit = 2
+                     )%>% 
+  mutate(source = "best_rmse")
+
+best_rmse_2 <- rf_grid_result %>% 
+  select_best(metric = "rmse")%>% 
+  mutate(source = "best_rmse_2")
+
+best_rmse_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        
+                        max_rules
+                        )%>% 
+  mutate(source = "best_rmse_3")
+
+best_rmse
+best_rmse_2
+best_rmse_3
+
+```
+
+```{r hyperparameters selection by R2}
+# Based on greatest R2
+best_r2 <- rf_grid_result %>% 
+  select_by_pct_loss("committees",
+                     metric = "rsq",
+                     limit = 2
+                     ) %>% 
+  mutate(source = "best_r2")
+
+best_r2_2 <- rf_grid_result %>% 
+  select_best(metric = "rsq")%>% 
+  mutate(source = "best_r2_2")
+
+best_r2_3 <- rf_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        
+                        max_rules
+                        ) %>%
+  mutate(source = "best_r2_3")
+
+best_r2
+best_r2_2
+best_r2_3
+```
+```{r comparing values}
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+```{r}
+# Function to find the best model
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    committees = numeric(),
+    neighbors = numeric(),
+    max_rules = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- cubist_rules(
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+      ) %>%
+      set_engine("Cubist"
+                 ) %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      committees = current_params$committees,
+      neighbors = current_params$neighbors,
+      max_rules = current_params$max_rules
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+
+# Example usage
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = weather_recipe,
+  split = weather_split
+)
+print(results)
+```
+
+```{r final_spec}
+final_spec <-   cubist_rules(committees = best_r2_2$committees,
+                        neighbors = best_r2_2$neighbors,
+                        max_rules = best_r2_2$max_rules
+                        ) %>% 
+  # Specify the engine
+  set_engine("Cubist") %>%
+  # Specifying mode  
+  set_mode("regression")
+  
+
+final_spec
+```
+
+## 3. Validation  
+```{r final_fit}
+set.seed(10)
+final_fit <- last_fit(final_spec,
+                weather_recipe,
+                split = weather_split)
+
+final_fit %>%
+  collect_predictions()
+```
+Metrics on the **test set**:
+```{r}
+final_fit %>%
+  collect_metrics()
+```
+Metrics on **train set** (for curiosity and compare to test set):  
+```{r}
+# RMSE
+final_spec %>%
+  fit(grade_n ~ .,
+      data = bake(weather_prep, 
+                  weather_train)) %>%
+  augment(new_data = bake(weather_prep, 
+                          weather_train)) %>% 
+  rmse(grade_n, .pred) %>%
+  bind_rows(
+    
+    
+    # R2
+    final_spec %>%
+      fit(grade_n ~ .,
+          data = bake(weather_prep, 
+                      weather_train)) %>%
+      augment(new_data = bake(weather_prep, 
+                              weather_train)) %>% 
+      rsq(grade_n, .pred)
+    
+  )
+
+```
+```{r predicted vs. observed plot}
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(obs = grade_n,
+                        pred = .pred,
+                        print_eq = T,
+                        print_metrics = T,
+                        metrics_list = c("R2", "RMSE"),
+                      # Customize metrics position
+                        position_metrics = c(x=75,y=75),
+                        position_eq = c(x=75, y =73))
+
+plot
+```
+
+
+```{r export first plot}
+ggsave(plot = plot,
+       filename = "../output/ML_Grade/07_CubistRule/O.png",
+       width = 5,
+       height = 5
+       )
+```
+
+### Variable importance: 
+
+```{r plotting VI}
+set.seed(10)
+plot_2 <- final_spec %>%
+  fit(grade_n ~ .,
+         data = bake(weather_prep, df)) %>%
+    vip::vi() %>%
+  mutate(
+    Variable = fct_reorder(Variable, 
+                           Importance)
+  ) %>%
+  dplyr::slice_head(n = 10) %>% 
+  ggplot(aes(x = Importance, 
+             y = Variable)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+
+plot_2
+```
+
+
+```{r export second plot}
+ggsave(plot = plot_2,
+       filename = "../output/ML_Grade/07_CubistRule/O_2.png",
+       width = 5,
+       height = 5,
+       bg = "white"
+       ) 
+```

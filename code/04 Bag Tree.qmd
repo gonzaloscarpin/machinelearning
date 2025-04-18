@@ -1,0 +1,530 @@
+---
+title: "04 Ensembles of decision trees"
+format: html
+---
+
+# Ensembles of decision trees Model for Cotton Lint Yield Prediction
+
+This document implements a BagTree regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
+
+## 1. Environment Setup
+
+First, we load all required packages for the analysis.
+
+```{r setup}
+#| message: false
+#| warning: false
+
+# Core modeling packages
+library(tidymodels)     # Unified modeling framework
+library(doParallel)     # For parallel processing
+library(tidyverse)      # Data manipulation and visualization
+library(baguette)         # Fast implementation of BagTree
+
+# Model interpretation packages
+library(vip)            # Variable importance plots
+library(shapviz)        # For Shapley value visualization
+library(fastshap)       # Fast computation of Shapley values
+
+# Additional utilities
+library(sf)             # Spatial data handling
+library(finetune)       # Advanced tuning methods
+library(readxl)         # Excel file import
+library(patchwork)      # Combine plots
+```
+
+## 2. Data Import and Exploration
+
+Let's import our dataset and examine its structure.
+
+```{r data_import}
+# Import cotton yield dataset
+df <- read_excel("../data/data_example.xlsx")
+
+# Display the first few rows of the data
+df
+```
+
+### 2.1 Exploratory Data Analysis
+
+Let's examine summary statistics to understand our data distribution.
+
+```{r data_summary}
+# Display summary statistics for all variables
+df %>% 
+  summary()
+```
+
+### 2.2 Data Preprocessing
+
+We need to transform categorical variables to factors and remove variables not needed for modeling.
+
+```{r data_wrangling}
+# Convert character variables to factors and remove year and block
+df_w <- df %>% 
+  mutate_if(is.character, as.factor) %>% 
+  dplyr::select(!(c(year, block)))
+
+# View the transformed data
+df_w
+```
+
+## 3. Machine Learning Workflow
+
+### 3.1 Data Splitting
+
+For robust model evaluation, we split the data into training (70%) and testing (30%) sets, stratified by the target variable.
+
+```{r data_split}
+# Setting seed to get reproducible results  
+set.seed(27)
+
+# Split data while preserving the distribution of the target variable
+df_split <- initial_split(df, prop = 0.7, strata = "lintyield_kgha")
+df_split
+```
+
+```{r extract_train_data}
+# Extract the training dataset
+df_train <- training(df_split)
+df_train
+```
+
+```{r extract_test_data}
+# Extract the testing dataset
+df_test <- testing(df_split)
+df_test
+```
+
+### 3.2 Visualizing Data Distribution
+
+Let's verify that our training and testing sets have similar distributions of the target variable.
+
+```{r visualize_data_distribution}
+# Combine the data frames with dataset labels
+plot_train <- df_train %>% mutate(Dataset = "Train")
+plot_test <- df_test %>% mutate(Dataset = "Test")
+combined_data <- bind_rows(plot_train, plot_test)
+
+# Create a density plot to compare distributions
+ggplot(data = combined_data) +
+  geom_rug(aes(x = lintyield_kgha, fill = Dataset)) +
+  geom_density(aes(x = lintyield_kgha, fill = Dataset), alpha = 0.5) +
+  scale_fill_manual(values = c("red", "blue")) +
+  labs(x = "Cotton Lint Yield (kg/ha)", 
+       y = "Density", 
+       fill = "Dataset",
+       title = "Distribution of Lint Yield in Training and Testing Sets")
+```
+  
+### 3.3 Feature Engineering
+
+We define a recipe for data preprocessing, removing unnecessary columns.
+
+```{r define_recipe}
+# Create a recipe to preprocess the data
+df_recipe <-
+  # Defining predicted and predictor variables
+  recipe(lintyield_kgha ~ ., data = df_train) %>%
+  # Remove year and block variables as they shouldn't influence predictions
+  step_rm(year, block) 
+
+# Display the recipe
+df_recipe
+```
+
+```{r prepare_recipe}
+# Prepare (train) the recipe on the training data
+df_prep <- df_recipe %>% prep()
+df_prep
+```
+
+## 4. Model Training
+
+### 4.1 Model Specification
+
+We define a Random Forest model with hyperparameters to be tuned.
+
+```{r model_specification}
+# Define the BagTree model with tunable parameters
+bag_spec <- 
+  bag_tree(tree_depth = tune(), #An integer for the maximum depth of the tree
+           min_n = tune(), #An integer for the minimum number of data points in a node that is required for the node to be split further.
+           cost_complexity = tune() #A positive number for the the cost/complexity parameter
+  ) %>% 
+  # Specify the engine
+  set_engine("rpart") %>% 
+  # Specifying mode  
+  set_mode("regression") %>% 
+  translate()
+
+bag_spec
+```
+
+### 4.2 Hyperparameter Tuning
+
+We'll use 5-fold cross-validation to find the optimal hyperparameters.
+
+```{r create_cv_folds}
+# Create 5-fold cross-validation resamples
+set.seed(15)
+resampling_foldcv <- vfold_cv(df_train, v = 5)
+```
+
+```{r tune_hyperparameters}
+# Tune the model using racing methods to efficiently search the parameter space
+set.seed(45)
+# Use parallel processing to speed up computation
+registerDoParallel(cores = parallel::detectCores() - 1)
+
+# Perform race-based tuning with ANOVA to eliminate poor-performing models early
+bag_grid_result <- tune_race_anova(
+  object = bag_spec,
+  preprocessor = df_recipe,
+  resamples = resampling_foldcv,
+  grid = 50  # Try 50 different hyperparameter combinations
+)
+
+# Stop parallel processing
+stopImplicitCluster()
+
+# View metrics from the first fold
+bag_grid_result$.metrics[[1]]
+```
+
+```{r visualize_tuning_results}
+# Visualize the hyperparameter tuning results
+autoplot(bag_grid_result)
+```
+
+### 4.3 Selecting Optimal Hyperparameters
+
+We'll evaluate different strategies for selecting the best hyperparameters.
+
+```{r select_by_rmse}
+# Selection methods based on RMSE
+# Method 1: Select model within 2% of the best RMSE, but with fewer trees
+best_rmse <- bag_grid_result %>% 
+  select_by_pct_loss("trees",
+                     metric = "rmse",
+                     limit = 2) %>% 
+  mutate(source = "best_rmse")
+
+# Method 2: Simply select the model with the lowest RMSE
+best_rmse_2 <- bag_grid_result %>% 
+  select_best(metric = "rmse") %>% 
+  mutate(source = "best_rmse_2")
+
+# Method 3: Select model within one standard error of the best RMSE
+best_rmse_3 <- bag_grid_result %>% 
+  select_by_one_std_err(metric = "rmse",
+                        cost_complexity) %>% 
+  mutate(source = "best_rmse_3")
+```
+
+```{r select_by_r2}
+# Selection methods based on R² (coefficient of determination)
+# Method 1: Select model within 2% of the best R², but with fewer trees
+best_r2 <- bag_grid_result %>% 
+  select_by_pct_loss("trees",
+                     metric = "rsq",
+                     limit = 2) %>% 
+  mutate(source = "best_r2")
+
+# Method 2: Simply select the model with the highest R²
+best_r2_2 <- bag_grid_result %>% 
+  select_best(metric = "rsq") %>% 
+  mutate(source = "best_r2_2")
+
+# Method 3: Select model within one standard error of the best R²
+best_r2_3 <- bag_grid_result %>% 
+  select_by_one_std_err(metric = "rsq",
+                        cost_complexity) %>%
+  mutate(source = "best_r2_3")
+```
+
+```{r combine_hyperparameters}
+# Combine all candidate hyperparameter sets for comparison
+hyperparameters_df <- best_rmse %>% 
+  bind_rows(best_rmse_2, best_rmse_3, best_r2, best_r2_2, best_r2_3)
+```
+
+### 4.4 Comparing Hyperparameter Performance
+
+We evaluate each set of hyperparameters on our validation data to select the best.
+
+```{r hyperparameter_comparison_function}
+# Function to compare the performance of different hyperparameter sets
+compare_hyperparameters <- function(params_df, recipe, split) {
+  # Create empty tibble to store results
+  results <- tibble(
+    cost_complexity = numeric(),
+    tree_depth = numeric(),
+    min_n = numeric(),
+    rmse = numeric(),
+    source = character()
+  )
+  
+  # Loop through each row of parameters
+  for(i in 1:nrow(params_df)) {
+    # Extract current parameters
+    current_params <- params_df[i, ]
+    
+    # Create model specification
+    set.seed(10)
+    current_spec <- bag_tree(
+      cost_complexity = current_params$cost_complexity,
+      tree_depth = current_params$tree_depth,
+      min_n = current_params$min_n
+      ) %>%
+      set_engine("rpart") %>%
+      set_mode('regression')
+    
+    # Fit model and collect metrics
+    current_fit <- last_fit(current_spec, 
+                            recipe, 
+                            split = split)
+    current_metrics <- current_fit %>% 
+      collect_metrics()
+    
+    # Extract RMSE value
+    current_rmse <- current_metrics %>% 
+      filter(.metric == "rmse") %>% 
+      pull(.estimate)
+    
+    # Store results
+    results <- results %>% add_row(
+      source = current_params$source,
+      rmse = current_rmse,
+      cost_complexity = current_params$cost_complexity,
+      tree_depth = current_params$tree_depth,
+      min_n = current_params$min_n
+    )
+  }
+  
+  # Find the best combination
+  best_params <- results %>% 
+    arrange(rmse) %>% 
+    dplyr::slice_head(n = 1)
+  
+  return(list(
+    all_results = results,
+    best_combination = best_params
+  ))
+}
+
+# Compare all hyperparameter sets
+results <- compare_hyperparameters(
+  params_df = hyperparameters_df,
+  recipe = df_recipe,
+  split = df_split
+)
+
+# Display results
+print(results)
+```
+
+### 4.5 Final Model Specification
+
+Using the best hyperparameters, we specify our final model.
+
+```{r final_model_specification}
+# Create the final model specification with the best hyperparameters
+# Note: Use the source identified as best from the results above
+final_spec <- bag_tree(tree_depth = best_rmse_2$tree_depth,
+           min_n = best_rmse_2$min_n,
+           cost_complexity = best_rmse_2$cost_complexity
+  )%>%
+  # Specify the engine
+  set_engine("rpart") %>% 
+  # Specifying mode  
+  set_mode("regression")
+
+# Display the final specification  
+final_spec
+```
+
+## 5. Model Validation
+
+Now we fit the model on the training data and evaluate on the test data.
+
+```{r final_model_fit}
+# Fit the final model and predict on test data
+set.seed(10)
+final_fit <- last_fit(
+  final_spec,
+  df_recipe,
+  split = df_split
+)
+
+# Display predictions on test data
+final_fit %>%
+  collect_predictions()
+```
+
+### 5.1 Test Set Performance
+
+Let's examine how well our model performs on the unseen test data.
+
+```{r test_metrics}
+# Calculate performance metrics on the test set
+final_fit %>%
+  collect_metrics()
+```
+
+### 5.2 Training Set Performance
+
+For comparison, we also check performance on the training data to assess potential overfitting.
+
+```{r train_metrics}
+# RMSE on training data
+train_metrics <- final_spec %>%
+  fit(lintyield_kgha ~ .,
+      data = bake(df_prep, df_train)) %>%
+  augment(new_data = bake(df_prep, df_train))
+
+# Calculate and combine RMSE and R² on training data
+train_metrics %>% 
+  rmse(lintyield_kgha, .pred) %>%
+  bind_rows(
+    train_metrics %>% 
+    rsq(lintyield_kgha, .pred)
+  )
+```
+
+### 5.3 Prediction Visualization
+
+Let's visualize how well our predictions match the observed values.
+
+```{r predicted_vs_observed}
+# Create scatter plot of predicted vs. observed values
+plot <- final_fit %>%
+  collect_predictions() %>%
+  metrica::scatter_plot(
+    obs = lintyield_kgha,
+    pred = .pred,
+    print_eq = TRUE,
+    print_metrics = TRUE,
+    metrics_list = c("R2", "RMSE"),
+    # Customize metrics position
+    position_metrics = c(x=700, y=1850),
+    position_eq = c(x=700, y=1930)
+  )
+
+# Display the plot
+plot
+```
+
+### 5.4 Comprehensive Performance Metrics
+
+Let's calculate a comprehensive set of performance metrics.
+
+```{r comprehensive_metrics}
+# Get predictions on test set
+test_results <- final_fit %>% 
+  collect_predictions()
+
+# Calculate multiple performance metrics
+metrics <- test_results %>% 
+  summarise(
+    RMSE = rmse_vec(truth = lintyield_kgha, estimate = .pred),
+    R2 = rsq_vec(lintyield_kgha, .pred),
+    Correlation = cor(.pred, lintyield_kgha),
+    SD = sd(.pred)  # Standard deviation of predictions
+  )
+
+# Display the metrics
+print(metrics)
+```
+
+## 6. Model Interpretation with Shapley Values
+
+Shapley values help us understand the contribution of each feature to individual predictions.
+
+### 6.1 Preparing for Shapley Analysis
+
+```{r prepare_shapley}
+# Extract the fitted model
+set.seed(27)
+fitted_model <- extract_fit_parsnip(final_fit$.workflow[[1]])
+
+# Define a prediction function for Shapley calculations
+predict_function <- function(model, newdata) {
+  predict(model, new_data = newdata)$.pred
+}
+
+# Prepare test data for Shapley analysis (without the target variable)
+X <- bake(df_prep, df_test) %>%
+       select(-lintyield_kgha)
+```
+
+### 6.2 Calculating Shapley Values
+
+```{r calculate_shapley}
+# Note: Consider increasing nsim for more robust results in production
+set.seed(27)
+
+system.time({ 
+  shap_values <- fastshap::explain(
+    fitted_model, 
+    X = X, 
+    pred_wrapper = predict_function,
+    adjust = TRUE,
+    parallel = FALSE,
+    nsim = 50  # Number of Monte Carlo simulations
+  )
+})
+```
+
+```{r create_shapviz}
+# Create a shapviz object for visualization
+shapviz_obj <- shapviz(shap_values, X = X)
+```
+
+### 6.3 Feature Importance Based on Shapley Values
+
+```{r shapley_importance}
+# Create a bar plot of feature importance
+shap_values_fi <- sv_importance(shapviz_obj, show_numbers = TRUE)
+shap_values_fi
+```
+
+### 6.4 Detailed Shapley Value Distribution
+
+```{r shapley_beeswarm}
+# Create a beeswarm plot showing the distribution of Shapley values
+shap_values_fi_bee <- sv_importance(shapviz_obj, kind = "bee")
+shap_values_fi_bee
+```
+
+### 6.5 Individual Prediction Analysis
+
+Let's examine how features contribute to specific predictions.
+
+```{r individual_prediction_analysis}
+# Show predictions
+final_fit %>% 
+  collect_predictions()
+
+# Waterfall plot for the first observation
+sv_waterfall(shapviz_obj, row_id = 1)
+
+# Force plot for the first observation
+sv_force(shapviz_obj, row_id = 1)
+```
+
+### 6.6 Combined Visualization
+
+Let's combine our key visualizations into one figure.
+
+```{r combined_plots, fig.height=11, fig.width=8}
+# Combine predicted vs observed plot with Shapley importance visualizations
+together <- plot / shap_values_fi / shap_values_fi_bee
+
+# Display the combined figure
+together
+```
+
+## 7. Conclusion
+
+This analysis demonstrates the application of BART for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.

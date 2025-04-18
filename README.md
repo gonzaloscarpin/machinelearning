@@ -1,5 +1,4 @@
-# machinelearning
-About this Project
+# About this Project
 This repository contains 18 different machine learning models used to predict cotton lint yield (kg/ha) based on a combination of genotypic, management, and environmental factors.
 
 The dataset used in this project includes observations from field experiments conducted with multiple varieties across different sowing dates, years, and environmental conditions. The main goal is to explore and compare the predictive performance of various ML algorithms for modeling lint yield response.

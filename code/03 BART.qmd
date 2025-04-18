@@ -1,11 +1,11 @@
 ---
-title: "02 XGBoost"
+title: "03 Bayesian Additive Regression Trees"
 format: html
 ---
 
-# XGBoost Model for Cotton Lint Yield Prediction
+# BART Model for Cotton Lint Yield Prediction
 
-This document implements a XGBoost regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
+This document implements a Bayesian Additive Regression Trees regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
 
 ## 1. Environment Setup
 
@@ -19,7 +19,6 @@ First, we load all required packages for the analysis.
 library(tidymodels)     # Unified modeling framework
 library(doParallel)     # For parallel processing
 library(tidyverse)      # Data manipulation and visualization
-library(xgboost)         # Fast implementation of XGboost
 
 # Model interpretation packages
 library(vip)            # Variable importance plots
@@ -127,9 +126,7 @@ df_recipe <-
   # Defining predicted and predictor variables
   recipe(lintyield_kgha ~ ., data = df_train) %>%
   # Remove year and block variables as they shouldn't influence predictions
-  step_rm(year, block) %>% 
-  # Transform to dummy variables factor predictors
-  step_dummy(all_factor_predictors())
+  step_rm(year, block) 
 
 # Display the recipe
 df_recipe
@@ -145,29 +142,20 @@ df_prep
 
 ### 4.1 Model Specification
 
-We define a XGBoost model with hyperparameters to be tuned.
+We define a Random Forest model with hyperparameters to be tuned.
 
 ```{r model_specification}
-# Define the XGBoost model specification with parameters to tune
-xgb_spec <- boost_tree(
-  # Model complexity parameters
-  trees = tune(),              # Number of trees (boosting iterations)
-  tree_depth = tune(),         # Maximum depth of trees (controls complexity)
-  min_n = tune(),              # Minimum number of data points in a node
-  loss_reduction = tune(),     # Minimum loss reduction for further partition
-  
-  # Randomness/stochasticity parameters  
-  sample_size = tune(),        # Fraction of data used in each tree
-  mtry = tune(),               # Number of predictors randomly sampled at each split
-  
-  # Learning parameters
-  learn_rate = tune()          # Step size shrinkage to prevent overfitting
-) %>%
-  set_engine("xgboost") %>%    # Use XGBoost as the implementation
-  set_mode("regression")       # Specify regression problem
+# Define the Random Forest model with tunable parameters
+bart_dbarts_spec <-
+  bart(trees = tune(), 
+       prior_terminal_node_coef = tune(), #A coefficient for the prior probability that a node is a terminal node
+       prior_terminal_node_expo = tune(), #An exponent in the prior probability that a node is a terminal node.
+       prior_outcome_range = tune()) %>% #A positive value that defines the width of a prior that the predicted outcome is within a certain range.
+  set_engine('dbarts') %>%
+  set_mode('regression')
 
-# Display model specification
-xgb_spec
+# Display the model specification
+bart_dbarts_spec
 ```
 
 ### 4.2 Hyperparameter Tuning
@@ -180,56 +168,25 @@ set.seed(15)
 resampling_foldcv <- vfold_cv(df_train, v = 5)
 ```
 
-
-```{r}
-# Create a Latin Hypercube sampling grid for efficient hyperparameter space exploration
-# This is more efficient than a regular grid search when you have many parameters
-xgb_grid <- grid_latin_hypercube(
-  trees(),                            # Number of trees to try
-  tree_depth(),                       # Tree depth values to try
-  min_n(),                            # Minimum node size values to try
-  loss_reduction(),                   # Loss reduction threshold values to try
-  sample_size = sample_prop(),        # Data sampling proportion values to try
-  finalize(mtry(), resampling_foldcv),# Number of predictors (finalized based on data)
-  learn_rate(),                       # Learning rate values to try
-  size = 100                          # Total number of parameter combinations to test
-)
-
-# Preview the first few parameter combinations
-head(xgb_grid)
-```
-
-
-
 ```{r tune_hyperparameters}
+# Tune the model using racing methods to efficiently search the parameter space
 set.seed(45)
+# Use parallel processing to speed up computation
 registerDoParallel(cores = parallel::detectCores() - 1)
 
-# Perform racing-based tuning with ANOVA to efficiently search parameter space
-# Racing methods can dramatically reduce computation time by eliminating poorly
-# performing parameter combinations early in the process
-xgb_tuning_results <- tune_race_anova(
-  object = xgb_spec,
-  preprocessor = df_recipe,  # Use your preprocessing recipe
-  resamples = resampling_foldcv,  # Cross-validation folds
-  grid = xgb_grid,                # Grid of hyperparameters to try
-  control = control_race(
-    save_pred = TRUE,             # Save predictions for later analysis
-    parallel_over = "everything", # Parallelize everything possible
-    verbose = TRUE                # Show progress
-  )
+# Perform race-based tuning with ANOVA to eliminate poor-performing models early
+bart_grid_result <- tune_race_anova(
+  object = bart_dbarts_spec,
+  preprocessor = df_recipe,
+  resamples = resampling_foldcv,
+  grid = 50  # Try 50 different hyperparameter combinations
 )
 
 # Stop parallel processing
 stopImplicitCluster()
 
-# Examine tuning results
-xgb_tuning_results
-```
-
-```{r visualize_tuning_results}
-# Visualize the hyperparameter tuning results
-autoplot(xgb_tuning_results)
+# View metrics from the first fold
+bart_grid_result$.metrics[[1]]
 ```
 
 ### 4.3 Selecting Optimal Hyperparameters
@@ -239,46 +196,42 @@ We'll evaluate different strategies for selecting the best hyperparameters.
 ```{r select_by_rmse}
 # Selection methods based on RMSE
 # Method 1: Select model within 2% of the best RMSE, but with fewer trees
-best_rmse <- xgb_tuning_results %>% 
-  select_by_pct_loss("min_n",
+best_rmse <- bart_grid_result %>% 
+  select_by_pct_loss("trees",
                      metric = "rmse",
-                     limit = 2
-                     )%>% 
+                     limit = 2) %>% 
   mutate(source = "best_rmse")
 
 # Method 2: Simply select the model with the lowest RMSE
-best_rmse_2 <- xgb_tuning_results %>% 
-  select_best(metric = "rmse")%>% 
+best_rmse_2 <- bart_grid_result %>% 
+  select_best(metric = "rmse") %>% 
   mutate(source = "best_rmse_2")
 
 # Method 3: Select model within one standard error of the best RMSE
-best_rmse_3 <- xgb_tuning_results %>% 
+best_rmse_3 <- bart_grid_result %>% 
   select_by_one_std_err(metric = "rmse",
-                        trees
-                        )%>% 
+                        prior_terminal_node_coef) %>% 
   mutate(source = "best_rmse_3")
 ```
 
 ```{r select_by_r2}
 # Selection methods based on R² (coefficient of determination)
 # Method 1: Select model within 2% of the best R², but with fewer trees
-best_r2 <- xgb_tuning_results %>% 
-  select_by_pct_loss("min_n",
+best_r2 <- bart_grid_result %>% 
+  select_by_pct_loss("trees",
                      metric = "rsq",
-                     limit = 2
-                     ) %>% 
+                     limit = 2) %>% 
   mutate(source = "best_r2")
 
 # Method 2: Simply select the model with the highest R²
-best_r2_2 <- xgb_tuning_results %>% 
-  select_best(metric = "rsq")%>% 
+best_r2_2 <- bart_grid_result %>% 
+  select_best(metric = "rsq") %>% 
   mutate(source = "best_r2_2")
 
 # Method 3: Select model within one standard error of the best R²
-best_r2_3 <- xgb_tuning_results %>% 
+best_r2_3 <- bart_grid_result %>% 
   select_by_one_std_err(metric = "rsq",
-                        trees
-                        ) %>%
+                        prior_terminal_node_coef) %>%
   mutate(source = "best_r2_3")
 ```
 
@@ -297,13 +250,10 @@ We evaluate each set of hyperparameters on our validation data to select the bes
 compare_hyperparameters <- function(params_df, recipe, split) {
   # Create empty tibble to store results
   results <- tibble(
-    mtry = numeric(),
     trees = numeric(),
-    min_n = numeric(),
-    tree_depth = numeric(),
-    learn_rate = numeric(),
-    loss_reduction = numeric(),
-    sample_size = numeric(),
+    prior_terminal_node_coef = numeric(),
+    prior_terminal_node_expo = numeric(),
+    prior_outcome_range = numeric(),
     rmse = numeric(),
     source = character()
   )
@@ -315,16 +265,13 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     
     # Create model specification
     set.seed(10)
-    current_spec <- boost_tree(
-      mtry = current_params$mtry,
+    current_spec <- parsnip::bart(
       trees = current_params$trees,
-      min_n = current_params$min_n,
-      tree_depth = current_params$tree_depth,
-      learn_rate = current_params$learn_rate,
-      loss_reduction = current_params$loss_reduction,
-      sample_size = current_params$sample_size,
+      prior_terminal_node_coef = current_params$prior_terminal_node_coef,
+      prior_terminal_node_expo = current_params$prior_terminal_node_expo,
+      prior_outcome_range = current_params$prior_outcome_range,
       ) %>%
-      set_engine("xgboost") %>%
+      set_engine("dbarts") %>%
       set_mode('regression')
     
     # Fit model and collect metrics
@@ -343,13 +290,10 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     results <- results %>% add_row(
       source = current_params$source,
       rmse = current_rmse,
-      mtry = current_params$mtry,
       trees = current_params$trees,
-      min_n = current_params$min_n,
-      tree_depth = current_params$tree_depth,
-      learn_rate = current_params$learn_rate,
-      loss_reduction = current_params$loss_reduction,
-      sample_size = current_params$sample_size
+      prior_terminal_node_coef = current_params$prior_terminal_node_coef,
+      prior_terminal_node_expo = current_params$prior_terminal_node_expo,
+      prior_outcome_range = current_params$prior_outcome_range
     )
   }
   
@@ -364,7 +308,8 @@ compare_hyperparameters <- function(params_df, recipe, split) {
   ))
 }
 
-# Example usage
+
+# Compare all hyperparameter sets
 results <- compare_hyperparameters(
   params_df = hyperparameters_df,
   recipe = df_recipe,
@@ -382,17 +327,12 @@ Using the best hyperparameters, we specify our final model.
 ```{r final_model_specification}
 # Create the final model specification with the best hyperparameters
 # Note: Use the source identified as best from the results above
-final_spec  <- boost_tree(
-  trees = best_r2$trees,
-  tree_depth = best_r2$tree_depth, 
-  min_n = best_r2$min_n,
-  loss_reduction = best_r2$loss_reduction,                     
-  sample_size = best_r2$sample_size, 
-  mtry = best_r2$mtry,           
-  learn_rate = best_r2$learn_rate) %>%
-  set_engine("xgboost") %>%
-  set_mode("regression")
-  
+final_spec <- parsnip::bart(trees = best_rmse_2$trees,
+                            prior_terminal_node_coef = best_rmse_2$prior_terminal_node_coef,
+                            prior_terminal_node_expo = best_rmse_2$prior_terminal_node_expo,
+                            prior_outcome_range = best_rmse_2$prior_outcome_range) %>% 
+  set_engine('dbarts') %>%
+  set_mode('regression')
 
 # Display the final specification  
 final_spec
@@ -504,10 +444,6 @@ fitted_model <- extract_fit_parsnip(final_fit$.workflow[[1]])
 
 # Define a prediction function for Shapley calculations
 predict_function <- function(model, newdata) {
-  # For XGBoost specifically, ensure data is numeric
-  if(inherits(model$fit, "xgb.Booster")) {
-    newdata <- as.matrix(newdata)
-  }
   predict(model, new_data = newdata)$.pred
 }
 
@@ -517,9 +453,11 @@ X <- bake(df_prep, df_test) %>%
 ```
 
 ### 6.2 Calculating Shapley Values
-```{r}
+
+```{r calculate_shapley}
 # Note: Consider increasing nsim for more robust results in production
 # We use parallel processing to speed up calculations
+
 set.seed(27)
 
 system.time({ 
@@ -585,4 +523,4 @@ together
 
 ## 7. Conclusion
 
-This analysis demonstrates the application of XGBoost for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.
+This analysis demonstrates the application of BART for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.

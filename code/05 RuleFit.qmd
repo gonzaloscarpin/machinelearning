@@ -22,15 +22,14 @@ library(tidyverse)      # Data manipulation and visualization
 library(rules)         # Fast implementation of RuleFit
 
 # Model interpretation packages
-library(vip)            # Variable importance plots
 library(shapviz)        # For Shapley value visualization
 library(fastshap)       # Fast computation of Shapley values
 
 # Additional utilities
-library(sf)             # Spatial data handling
 library(finetune)       # Advanced tuning methods
 library(readxl)         # Excel file import
 library(patchwork)      # Combine plots
+tidymodels_prefer()
 ```
 
 ## 2. Data Import and Exploration
@@ -62,8 +61,7 @@ We need to transform categorical variables to factors and remove variables not n
 ```{r data_wrangling}
 # Convert character variables to factors and remove year and block
 df_w <- df %>% 
-  mutate_if(is.character, as.factor) %>% 
-  dplyr::select(!(c(year, block)))
+  mutate_if(is.character, as.factor)
 
 # View the transformed data
 df_w

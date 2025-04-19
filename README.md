@@ -1,5 +1,5 @@
 # About this Project
-This repository contains 18 different machine learning models used to predict cotton lint yield (kg/ha) based on a combination of genotypic, management, and environmental factors.
+This repository contains 17 different machine learning models used to predict cotton lint yield (kg/ha) based on a combination of genotypic, management, and environmental factors.
 
 The dataset used in this project includes observations from field experiments conducted with multiple varieties across different sowing dates, years, and environmental conditions. The main goal is to explore and compare the predictive performance of various ML algorithms for modeling lint yield response.
 
@@ -25,27 +25,29 @@ Solar radiation (MJ/m²)
 Reference evapotranspiration (mm)
 
 🤖 Machine Learning Models Implemented
+
 The following ML methods were used to predict lint yield:
 
-Random Forest
+01 Random Forest
 
-XGBoost
+02 XGBoost
 
-Generalized Random Forest (GRF)
+03 Bayesian Additive Regression Trees (BART)
 
-Bayesian Additive Regression Trees (BART)
+04 Bagged Decision Trees
 
-Bagged Decision Trees
+05 RuleFit
 
+06 Cubist Rule-Based Model
+
+07 Classification and Regression Trees (CART)
+
+08 Elastic Net - Linear Regression
 Support Vector Machines - linear kernel
 
 Support Vector Machines - polynomial kernel
 
-RuleFit
 
-Cubist Rule-Based Model
-
-Linear Regression
 
 Partial Least Squares (PLS)
 
@@ -59,7 +61,7 @@ Bagged MARS
 
 Bagged MLP
 
-Classification and Regression Trees (CART)
+
 
 Poisson Regression
 

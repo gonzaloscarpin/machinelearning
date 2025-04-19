@@ -1,11 +1,11 @@
 ---
-title: "04 Ensembles of decision trees"
+title: "07 Decision trees"
 format: html
 ---
 
-# Ensembles of decision trees Model for Cotton Lint Yield Prediction
+# Decision trees Model for Cotton Lint Yield Prediction
 
-This document implements a BagTree regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
+This document implements a Decision tree regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
 
 ## 1. Environment Setup
 
@@ -19,7 +19,8 @@ First, we load all required packages for the analysis.
 library(tidymodels)     # Unified modeling framework
 library(doParallel)     # For parallel processing
 library(tidyverse)      # Data manipulation and visualization
-library(baguette)         # Fast implementation of BagTree
+library(partykit)
+library(bonsai)         # Fast implementation of decision tree
 
 # Model interpretation packages
 library(shapviz)        # For Shapley value visualization
@@ -144,19 +145,19 @@ df_prep
 We define a Random Forest model with hyperparameters to be tuned.
 
 ```{r model_specification}
-# Define the BagTree model with tunable parameters
-bag_spec <- 
-  bag_tree(tree_depth = tune(), #An integer for the maximum depth of the tree
-           min_n = tune(), #An integer for the minimum number of data points in a node that is required for the node to be split further.
-           cost_complexity = tune() #A positive number for the the cost/complexity parameter
-  ) %>% 
+# Define the CART model with tunable parameters
+cart_spec <- 
+  decision_tree(tree_depth = tune(), #maximum depth of the tree
+                min_n = tune() #minimum number of data points in a node that are required for the node to be split further
+                ) %>% 
   # Specify the engine
-  set_engine("rpart") %>% 
+  set_engine("partykit", 
+             conditional_min_criterion = tune()
+             ) %>% 
   # Specifying mode  
-  set_mode("regression") %>% 
-  translate()
+  set_mode("regression")
 
-bag_spec
+cart_spec
 ```
 
 ### 4.2 Hyperparameter Tuning
@@ -169,6 +170,14 @@ set.seed(15)
 resampling_foldcv <- vfold_cv(df_train, v = 5)
 ```
 
+```{r cit_param}
+cit_param <- cart_spec %>% 
+  extract_parameter_set_dials() %>% 
+  update(conditional_min_criterion =conditional_min_criterion())
+
+```
+
+
 ```{r tune_hyperparameters}
 # Tune the model using racing methods to efficiently search the parameter space
 set.seed(45)
@@ -176,23 +185,23 @@ set.seed(45)
 registerDoParallel(cores = parallel::detectCores() - 1)
 
 # Perform race-based tuning with ANOVA to eliminate poor-performing models early
-bag_grid_result <- tune_race_anova(
-  object = bag_spec,
-  preprocessor = df_recipe,
-  resamples = resampling_foldcv,
-  grid = 50  # Try 50 different hyperparameter combinations
-)
+cart_grid_result <- tune_race_anova(object = cart_spec,
+                                   preprocessor = df_recipe,
+                                   resamples = resampling_foldcv,
+                                   param_info = cit_param,
+                                  grid = 50
+                      )
 
 # Stop parallel processing
 stopImplicitCluster()
 
 # View metrics from the first fold
-bag_grid_result$.metrics[[1]]
+cart_grid_result$.metrics[[1]]
 ```
 
 ```{r visualize_tuning_results}
 # Visualize the hyperparameter tuning results
-autoplot(bag_grid_result)
+autoplot(cart_grid_result)
 ```
 
 ### 4.3 Selecting Optimal Hyperparameters
@@ -202,42 +211,42 @@ We'll evaluate different strategies for selecting the best hyperparameters.
 ```{r select_by_rmse}
 # Selection methods based on RMSE
 # Method 1: Select model within 2% of the best RMSE, but with fewer trees
-best_rmse <- bag_grid_result %>% 
-  select_by_pct_loss("trees",
+best_rmse <- cart_grid_result %>% 
+  select_by_pct_loss("tree_depth",
                      metric = "rmse",
                      limit = 2) %>% 
   mutate(source = "best_rmse")
 
 # Method 2: Simply select the model with the lowest RMSE
-best_rmse_2 <- bag_grid_result %>% 
+best_rmse_2 <- cart_grid_result %>% 
   select_best(metric = "rmse") %>% 
   mutate(source = "best_rmse_2")
 
 # Method 3: Select model within one standard error of the best RMSE
-best_rmse_3 <- bag_grid_result %>% 
+best_rmse_3 <- cart_grid_result %>% 
   select_by_one_std_err(metric = "rmse",
-                        cost_complexity) %>% 
+                        tree_depth) %>% 
   mutate(source = "best_rmse_3")
 ```
 
 ```{r select_by_r2}
 # Selection methods based on R² (coefficient of determination)
 # Method 1: Select model within 2% of the best R², but with fewer trees
-best_r2 <- bag_grid_result %>% 
-  select_by_pct_loss("trees",
+best_r2 <- cart_grid_result %>% 
+  select_by_pct_loss("tree_depth",
                      metric = "rsq",
                      limit = 2) %>% 
   mutate(source = "best_r2")
 
 # Method 2: Simply select the model with the highest R²
-best_r2_2 <- bag_grid_result %>% 
+best_r2_2 <- cart_grid_result %>% 
   select_best(metric = "rsq") %>% 
   mutate(source = "best_r2_2")
 
 # Method 3: Select model within one standard error of the best R²
-best_r2_3 <- bag_grid_result %>% 
+best_r2_3 <- cart_grid_result %>% 
   select_by_one_std_err(metric = "rsq",
-                        cost_complexity) %>%
+                        tree_depth) %>%
   mutate(source = "best_r2_3")
 ```
 
@@ -256,9 +265,9 @@ We evaluate each set of hyperparameters on our validation data to select the bes
 compare_hyperparameters <- function(params_df, recipe, split) {
   # Create empty tibble to store results
   results <- tibble(
-    cost_complexity = numeric(),
     tree_depth = numeric(),
     min_n = numeric(),
+    conditional_min_criterion = numeric(),
     rmse = numeric(),
     source = character()
   )
@@ -270,20 +279,18 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     
     # Create model specification
     set.seed(10)
-    current_spec <- bag_tree(
-      cost_complexity = current_params$cost_complexity,
+    current_spec <- decision_tree(
       tree_depth = current_params$tree_depth,
       min_n = current_params$min_n
       ) %>%
-      set_engine("rpart") %>%
+      set_engine('partykit',
+      conditional_min_criterion = current_params$current_params
+                 ) %>%
       set_mode('regression')
     
     # Fit model and collect metrics
-    current_fit <- last_fit(current_spec, 
-                            recipe, 
-                            split = split)
-    current_metrics <- current_fit %>% 
-      collect_metrics()
+    current_fit <- last_fit(current_spec, recipe, split = split)
+    current_metrics <- current_fit %>% collect_metrics()
     
     # Extract RMSE value
     current_rmse <- current_metrics %>% 
@@ -292,18 +299,18 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     
     # Store results
     results <- results %>% add_row(
-      source = current_params$source,
-      rmse = current_rmse,
-      cost_complexity = current_params$cost_complexity,
       tree_depth = current_params$tree_depth,
-      min_n = current_params$min_n
+      min_n = current_params$min_n,
+      conditional_min_criterion =current_params$conditional_min_criterion,
+      rmse = current_rmse,
+      source = current_params$source
     )
   }
   
   # Find the best combination
   best_params <- results %>% 
     arrange(rmse) %>% 
-    dplyr::slice_head(n = 1)
+    slice(1)
   
   return(list(
     all_results = results,
@@ -329,12 +336,12 @@ Using the best hyperparameters, we specify our final model.
 ```{r final_model_specification}
 # Create the final model specification with the best hyperparameters
 # Note: Use the source identified as best from the results above
-final_spec <- bag_tree(tree_depth = best_rmse_2$tree_depth,
-           min_n = best_rmse_2$min_n,
-           cost_complexity = best_rmse_2$cost_complexity
-  )%>%
+final_spec <- decision_tree(tree_depth = best_rmse$tree_depth,
+                            min_n = best_rmse$min_n
+                            ) %>%
   # Specify the engine
-  set_engine("rpart") %>% 
+  set_engine("partykit",
+             conditional_min_criterion = best_rmse$conditional_min_criterion) %>%
   # Specifying mode  
   set_mode("regression")
 
@@ -460,6 +467,9 @@ X <- bake(df_prep, df_test) %>%
 
 ```{r calculate_shapley}
 # Note: Consider increasing nsim for more robust results in production
+# We use parallel processing to speed up calculations
+
+registerDoParallel(cores = 12)  # Use parallel processing with 12 cores
 set.seed(27)
 
 system.time({ 
@@ -468,10 +478,12 @@ system.time({
     X = X, 
     pred_wrapper = predict_function,
     adjust = TRUE,
-    parallel = FALSE,
+    parallel = TRUE,
     nsim = 50  # Number of Monte Carlo simulations
   )
 })
+
+stopImplicitCluster()
 ```
 
 ```{r create_shapviz}
@@ -525,4 +537,4 @@ together
 
 ## 7. Conclusion
 
-This analysis demonstrates the application of BART for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.
+This analysis demonstrates the application of Decision Tree for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.

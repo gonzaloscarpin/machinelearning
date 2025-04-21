@@ -141,7 +141,7 @@ df_prep
 
 ### 4.1 Model Specification
 
-We define a Random Forest model with hyperparameters to be tuned.
+We define a bag_tree model with hyperparameters to be tuned.
 
 ```{r model_specification}
 # Define the BagTree model with tunable parameters

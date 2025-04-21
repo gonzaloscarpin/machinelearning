@@ -144,7 +144,7 @@ df_prep
 
 ### 4.1 Model Specification
 
-We define a Random Forest model with hyperparameters to be tuned.
+We define a poisson_reg model with hyperparameters to be tuned.
 
 ```{r hyperparameters}
 poisson_spec <-

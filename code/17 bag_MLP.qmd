@@ -114,7 +114,7 @@ ggplot(data = combined_data) +
        fill = "Dataset",
        title = "Distribution of Lint Yield in Training and Testing Sets")
 ```
-  
+
 ### 3.3 Feature Engineering
 
 We define a recipe for data preprocessing, removing unnecessary columns.
@@ -149,7 +149,7 @@ df_prep
 
 ### 4.1 Model Specification
 
-We define a Random Forest model with hyperparameters to be tuned.
+We define a bag_mlp model with hyperparameters to be tuned.
 
 ```{r model_specification}
 # Define the bagmlp model with tunable parameters

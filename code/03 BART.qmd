@@ -140,10 +140,10 @@ df_prep
 
 ### 4.1 Model Specification
 
-We define a Random Forest model with hyperparameters to be tuned.
+We define a bart model with hyperparameters to be tuned.
 
 ```{r model_specification}
-# Define the Random Forest model with tunable parameters
+# Define the BART model with tunable parameters
 bart_dbarts_spec <-
   bart(trees = tune(), 
        prior_terminal_node_coef = tune(), #A coefficient for the prior probability that a node is a terminal node

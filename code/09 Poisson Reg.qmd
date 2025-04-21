@@ -1,5 +1,5 @@
 ---
-title: "08 Elastic Net"
+title: "09 Poisson Reg"
 format: html
 ---
 
@@ -19,7 +19,7 @@ First, we load all required packages for the analysis.
 library(tidymodels)     # Unified modeling framework
 library(doParallel)     # For parallel processing
 library(tidyverse)      # Data manipulation and visualization
-library(glmnet)         # Fast implementation of ElasticNet
+library(poissonreg)         # Fast implementation of PoissonReg
 
 # Model interpretation packages
 library(shapviz)        # For Shapley value visualization
@@ -128,9 +128,7 @@ df_recipe <-
   step_rm(year, block) %>%
   step_dummy(all_factor_predictors()) %>% 
   step_zv(all_numeric_predictors()) %>% 
-  step_corr(all_numeric_predictors(), threshold = 0.85) %>% 
-  step_center(all_numeric_predictors()) %>% 
-  step_scale(all_numeric_predictors())
+  step_corr(all_numeric_predictors(), threshold = 0.85)
 
 # Display the recipe
 df_recipe
@@ -149,22 +147,21 @@ df_prep
 We define a Random Forest model with hyperparameters to be tuned.
 
 ```{r hyperparameters}
-enet_spec <- 
-  # Specifying linear_reg as our model type, asking to tune the hyperparameters
-  linear_reg(penalty = tune(), #Amount of Regularizatio
+poisson_spec <-
+  poisson_reg(penalty = tune(), #Amount of Regularizatio
              mixture = tune() #Proportion of Lasso Penalty
              ) %>% 
   # Specify the engine
   set_engine("glmnet") %>% 
   translate()
 
-enet_spec
+poisson_spec
 ```
 
 Setting grid for exploration of values
 
 ```{r grid}
-enet_grid <- grid_regular(penalty(range = c(1e-4, 10)),
+poisson_grid <- grid_regular(penalty(range = c(1e-4, 10)),
                           mixture(range = c(0, 1)),
                           levels = list(penalty = 20, 
                                         mixture = 10))
@@ -187,8 +184,8 @@ set.seed(45)
 registerDoParallel(cores = parallel::detectCores() - 1)
 
 # Perform race-based tuning with ANOVA to eliminate poor-performing models early
-enet_grid_result <- tune_grid(object = enet_spec,
-                      grid = enet_grid,
+poisson_grid_result <- tune_grid(object = poisson_spec,
+                      grid = poisson_grid,
                       preprocessor = df_recipe,
                       resamples = resampling_foldcv
                       )
@@ -196,12 +193,12 @@ enet_grid_result <- tune_grid(object = enet_spec,
 stopImplicitCluster()
 
 # View metrics from the first fold
-enet_grid_result$.metrics[[5]]
+poisson_grid_result$.metrics[[5]]
 ```
 
 ```{r visualize_tuning_results}
 # Visualize the hyperparameter tuning results
-autoplot(enet_grid_result)
+autoplot(poisson_grid_result)
 ```
 
 ### 4.3 Selecting Optimal Hyperparameters
@@ -211,19 +208,19 @@ We'll evaluate different strategies for selecting the best hyperparameters.
 ```{r select_by_rmse}
 # Selection methods based on RMSE
 # Method 1: Select model within 2% of the best RMSE, but with fewer trees
-best_rmse <- enet_grid_result %>% 
+best_rmse <- poisson_grid_result %>% 
   select_by_pct_loss("penalty",
                      metric = "rmse",
                      limit = 2) %>% 
   mutate(source = "best_rmse")
 
 # Method 2: Simply select the model with the lowest RMSE
-best_rmse_2 <- enet_grid_result %>% 
+best_rmse_2 <- poisson_grid_result %>% 
   select_best(metric = "rmse") %>% 
   mutate(source = "best_rmse_2")
 
 # Method 3: Select model within one standard error of the best RMSE
-best_rmse_3 <- enet_grid_result %>% 
+best_rmse_3 <- poisson_grid_result %>% 
   select_by_one_std_err(metric = "rmse",
                         mixture) %>% 
   mutate(source = "best_rmse_3")
@@ -232,19 +229,19 @@ best_rmse_3 <- enet_grid_result %>%
 ```{r select_by_r2}
 # Selection methods based on R² (coefficient of determination)
 # Method 1: Select model within 2% of the best R², but with fewer trees
-best_r2 <- enet_grid_result %>% 
+best_r2 <- poisson_grid_result %>% 
   select_by_pct_loss("penalty",
                      metric = "rsq",
                      limit = 2) %>% 
   mutate(source = "best_r2")
 
 # Method 2: Simply select the model with the highest R²
-best_r2_2 <- enet_grid_result %>% 
+best_r2_2 <- poisson_grid_result %>% 
   select_best(metric = "rsq") %>% 
   mutate(source = "best_r2_2")
 
 # Method 3: Select model within one standard error of the best R²
-best_r2_3 <- enet_grid_result %>% 
+best_r2_3 <- poisson_grid_result %>% 
   select_by_one_std_err(metric = "rsq",
                         mixture) %>%
   mutate(source = "best_r2_3")
@@ -278,7 +275,7 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     
     # Create model specification
     set.seed(10)
-    current_spec <- linear_reg(
+    current_spec <- poisson_reg(
       penalty = current_params$penalty,
       mixture = current_params$mixture
       ) %>%
@@ -337,8 +334,8 @@ Using the best hyperparameters, we specify our final model.
 ```{r final_model_specification}
 # Create the final model specification with the best hyperparameters
 # Note: Use the source identified as best from the results above
-final_spec <- linear_reg(penalty = best_rmse_2$penalty,
-                         mixture = best_rmse_2$mixture
+final_spec <- poisson_reg(penalty = best_r2_2$penalty,
+                         mixture = best_r2_2$mixture
                          ) %>% 
   set_engine("glmnet")
 
@@ -534,4 +531,4 @@ together
 
 ## 7. Conclusion
 
-This analysis demonstrates the application of Elastic-Net for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.
+This analysis demonstrates the application of Poisson Regression for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.

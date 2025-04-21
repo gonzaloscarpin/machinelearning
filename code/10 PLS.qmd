@@ -1,11 +1,11 @@
 ---
-title: "08 Elastic Net"
+title: "10 Partial least squares"
 format: html
 ---
 
-# Linear Regression Model for Cotton Lint Yield Prediction
+# Partial Least Squares Model for Cotton Lint Yield Prediction
 
-This document implements a Elastic Net regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
+This document implements a PLS regression model to predict cotton lint yield based on genotypic, management, and environmental factors. The workflow includes data preparation, model training with hyperparameter tuning, validation, and interpretation using Shapley values.
 
 ## 1. Environment Setup
 
@@ -19,7 +19,7 @@ First, we load all required packages for the analysis.
 library(tidymodels)     # Unified modeling framework
 library(doParallel)     # For parallel processing
 library(tidyverse)      # Data manipulation and visualization
-library(glmnet)         # Fast implementation of ElasticNet
+library(plsmod)         # Fast implementation of PLS
 
 # Model interpretation packages
 library(shapviz)        # For Shapley value visualization
@@ -61,7 +61,7 @@ We need to transform categorical variables to factors and remove variables not n
 ```{r data_wrangling}
 # Convert character variables to factors and remove year and block
 df_w <- df %>% 
-  mutate_if(is.character, as.factor) 
+  mutate_if(is.character, as.factor)
 
 # View the transformed data
 df_w
@@ -117,7 +117,7 @@ ggplot(data = combined_data) +
   
 ### 3.3 Feature Engineering
 
-We define a recipe for data preprocessing, removing unnecessary columns and including recommend pre-processing.
+We define a recipe for data preprocessing, removing unnecessary columns.
 
 ```{r define_recipe}
 # Create a recipe to preprocess the data
@@ -126,11 +126,11 @@ df_recipe <-
   recipe(lintyield_kgha ~ ., data = df_train) %>%
   # Remove year and block variables as they shouldn't influence predictions
   step_rm(year, block) %>%
-  step_dummy(all_factor_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
   step_zv(all_numeric_predictors()) %>% 
-  step_corr(all_numeric_predictors(), threshold = 0.85) %>% 
-  step_center(all_numeric_predictors()) %>% 
-  step_scale(all_numeric_predictors())
+  step_normalize(all_predictors()) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
 
 # Display the recipe
 df_recipe
@@ -148,26 +148,15 @@ df_prep
 
 We define a Random Forest model with hyperparameters to be tuned.
 
-```{r hyperparameters}
-enet_spec <- 
-  # Specifying linear_reg as our model type, asking to tune the hyperparameters
-  linear_reg(penalty = tune(), #Amount of Regularizatio
-             mixture = tune() #Proportion of Lasso Penalty
-             ) %>% 
-  # Specify the engine
-  set_engine("glmnet") %>% 
+```{r model_specification}
+# Define the PLS model with tunable parameters
+pls_mixOmics_spec <- pls(num_comp = tune(), ## Components
+                         predictor_prop = tune() #Proportion of Predictors
+                         ) %>% 
+  set_engine("mixOmics") %>% 
+  set_mode("regression") %>% 
   translate()
-
-enet_spec
-```
-
-Setting grid for exploration of values
-
-```{r grid}
-enet_grid <- grid_regular(penalty(range = c(1e-4, 10)),
-                          mixture(range = c(0, 1)),
-                          levels = list(penalty = 20, 
-                                        mixture = 10))
+pls_mixOmics_spec
 ```
 
 ### 4.2 Hyperparameter Tuning
@@ -187,21 +176,22 @@ set.seed(45)
 registerDoParallel(cores = parallel::detectCores() - 1)
 
 # Perform race-based tuning with ANOVA to eliminate poor-performing models early
-enet_grid_result <- tune_grid(object = enet_spec,
-                      grid = enet_grid,
+pls_grid_result <- tune_race_anova(object = pls_mixOmics_spec,
                       preprocessor = df_recipe,
-                      resamples = resampling_foldcv
+                      resamples = resampling_foldcv,
+                     grid = 50
                       )
+
 # Stop parallel processing
 stopImplicitCluster()
 
 # View metrics from the first fold
-enet_grid_result$.metrics[[5]]
+pls_grid_result$.metrics[[1]]
 ```
 
 ```{r visualize_tuning_results}
 # Visualize the hyperparameter tuning results
-autoplot(enet_grid_result)
+autoplot(pls_grid_result)
 ```
 
 ### 4.3 Selecting Optimal Hyperparameters
@@ -211,42 +201,42 @@ We'll evaluate different strategies for selecting the best hyperparameters.
 ```{r select_by_rmse}
 # Selection methods based on RMSE
 # Method 1: Select model within 2% of the best RMSE, but with fewer trees
-best_rmse <- enet_grid_result %>% 
-  select_by_pct_loss("penalty",
+best_rmse <- pls_grid_result %>% 
+  select_by_pct_loss("predictor_prop",
                      metric = "rmse",
                      limit = 2) %>% 
   mutate(source = "best_rmse")
 
 # Method 2: Simply select the model with the lowest RMSE
-best_rmse_2 <- enet_grid_result %>% 
+best_rmse_2 <- pls_grid_result %>% 
   select_best(metric = "rmse") %>% 
   mutate(source = "best_rmse_2")
 
 # Method 3: Select model within one standard error of the best RMSE
-best_rmse_3 <- enet_grid_result %>% 
+best_rmse_3 <- pls_grid_result %>% 
   select_by_one_std_err(metric = "rmse",
-                        mixture) %>% 
+                        num_comp) %>% 
   mutate(source = "best_rmse_3")
 ```
 
 ```{r select_by_r2}
 # Selection methods based on R² (coefficient of determination)
 # Method 1: Select model within 2% of the best R², but with fewer trees
-best_r2 <- enet_grid_result %>% 
-  select_by_pct_loss("penalty",
+best_r2 <- pls_grid_result %>% 
+  select_by_pct_loss("predictor_prop",
                      metric = "rsq",
                      limit = 2) %>% 
   mutate(source = "best_r2")
 
 # Method 2: Simply select the model with the highest R²
-best_r2_2 <- enet_grid_result %>% 
+best_r2_2 <- pls_grid_result %>% 
   select_best(metric = "rsq") %>% 
   mutate(source = "best_r2_2")
 
 # Method 3: Select model within one standard error of the best R²
-best_r2_3 <- enet_grid_result %>% 
+best_r2_3 <- pls_grid_result %>% 
   select_by_one_std_err(metric = "rsq",
-                        mixture) %>%
+                        num_comp) %>%
   mutate(source = "best_r2_3")
 ```
 
@@ -265,8 +255,8 @@ We evaluate each set of hyperparameters on our validation data to select the bes
 compare_hyperparameters <- function(params_df, recipe, split) {
   # Create empty tibble to store results
   results <- tibble(
-    penalty = numeric(),
-    mixture = numeric(),
+    predictor_prop = numeric(),
+    num_comp = numeric(),
     rmse = numeric(),
     source = character()
   )
@@ -278,11 +268,11 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     
     # Create model specification
     set.seed(10)
-    current_spec <- linear_reg(
-      penalty = current_params$penalty,
-      mixture = current_params$mixture
+    current_spec <- pls(
+      num_comp = current_params$num_comp,
+      predictor_prop = current_params$predictor_prop
       ) %>%
-      set_engine("glmnet"
+      set_engine("mixOmics"
                  ) %>%
       set_mode('regression')
     
@@ -302,8 +292,8 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     results <- results %>% add_row(
       source = current_params$source,
       rmse = current_rmse,
-      penalty = current_params$penalty,
-      mixture = current_params$mixture
+      predictor_prop = current_params$predictor_prop,
+      num_comp = current_params$num_comp
     )
   }
   
@@ -317,7 +307,6 @@ compare_hyperparameters <- function(params_df, recipe, split) {
     best_combination = best_params
   ))
 }
-
 
 # Compare all hyperparameter sets
 results <- compare_hyperparameters(
@@ -337,10 +326,11 @@ Using the best hyperparameters, we specify our final model.
 ```{r final_model_specification}
 # Create the final model specification with the best hyperparameters
 # Note: Use the source identified as best from the results above
-final_spec <- linear_reg(penalty = best_rmse_2$penalty,
-                         mixture = best_rmse_2$mixture
+final_spec <- pls(num_comp = best_rmse$num_comp,
+                  predictor_prop = best_rmse$predictor_prop
                          ) %>% 
-  set_engine("glmnet")
+  set_engine("mixOmics") %>% 
+  set_mode("regression")
 
 # Display the final specification  
 final_spec
@@ -534,4 +524,4 @@ together
 
 ## 7. Conclusion
 
-This analysis demonstrates the application of Elastic-Net for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.
+This analysis demonstrates the application of PLS for predicting cotton lint yield. The model achieves good predictive performance, and Shapley values provide insights into the contribution of different features to the predictions.

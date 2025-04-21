@@ -43,27 +43,24 @@ The following ML methods were used to predict lint yield:
 07 Classification and Regression Trees (CART)
 
 08 Elastic Net - Linear Regression
-Support Vector Machines - linear kernel
 
-Support Vector Machines - polynomial kernel
+09 Poisson Regression
 
+10 Partial Least Squares (PLS)
 
+11 Support Vector Machines - linear kernel
 
-Partial Least Squares (PLS)
+12 Support Vector Machines - polynomial kernel
 
-k-Nearest Neighbors (kNN)
+13 k-Nearest Neighbors (kNN)
 
-Multilayer Perceptron (MLP)
+14 Multivariate Adaptive Regression Splines (MARS)
 
-Multivariate Adaptive Regression Splines (MARS)
+15 Bagged MARS
 
-Bagged MARS
+16 Multilayer Perceptron (MLP)
 
-Bagged MLP
-
-
-
-Poisson Regression
+17 Bagged MLP
 
 Each method is implemented as a separate .qmd (Quarto) file and includes data preprocessing, model fitting, evaluation (e.g., RMSE), and visualization.
 

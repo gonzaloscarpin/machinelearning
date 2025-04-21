@@ -1,30 +1,30 @@
 # About this Project
+
 This repository contains 17 different machine learning models used to predict cotton lint yield (kg/ha) based on a combination of genotypic, management, and environmental factors.
 
 The dataset used in this project includes observations from field experiments conducted with multiple varieties across different sowing dates, years, and environmental conditions. The main goal is to explore and compare the predictive performance of various ML algorithms for modeling lint yield response.
 
-🎯 Objective
-To predict cotton lint yield using:
+## 🎯 Objective: to predict cotton lint yield using:
 
-Sowing date (early vs. late)
+-   Sowing date (early vs. late)
 
-Variety name and year of release
+-   Variety name and year of release
 
-Main meteorological variables during the crop's critical period:
+-   Main meteorological variables during the crop's critical period:
 
-Mean maximum temperature (°C)
+-   Mean maximum temperature (°C)
 
-Mean minimum temperature (°C)
+-   Mean minimum temperature (°C)
 
-Cumulative heliophany (h)
+-   Cumulative heliophany (h)
 
-Total precipitation (mm)
+-   Total precipitation (mm)
 
-Solar radiation (MJ/m²)
+-   Solar radiation (MJ/m²)
 
-Reference evapotranspiration (mm)
+-   Reference evapotranspiration (mm)
 
-🤖 Machine Learning Models Implemented
+## 🤖 Machine Learning Models Implemented
 
 The following ML methods were used to predict lint yield:
 
@@ -63,5 +63,3 @@ The following ML methods were used to predict lint yield:
 17 Bagged MLP
 
 Each method is implemented as a separate .qmd (Quarto) file and includes data preprocessing, model fitting, evaluation (e.g., RMSE), and visualization.
-
-
